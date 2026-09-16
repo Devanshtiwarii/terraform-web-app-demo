@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+
+<html lang="en">
+
+<head>
+
+    <meta charset="UTF-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>Cloud Image App</title>
+
+</head>
+
+
+<body>
+
+    <h1>My Cloud Image App</h1>
+
+
+    <!-- ================================================= -->
+    <!-- UPLOAD IMAGE -->
+    <!-- ================================================= -->
+
+    <h2>Upload Image</h2>
+
+    <form
+        action="{{ url_for('upload') }}"
+        method="POST"
+        enctype="multipart/form-data"
+    >
+
+        <input
+            type="file"
+            name="image"
+            accept="image/*"
+            required
+        >
+
+        <button type="submit">
+            Upload
+        </button>
+
+    </form>
+
+
+    <hr>
+
+
+    <!-- ================================================= -->
+    <!-- IMAGE LIST -->
+    <!-- ================================================= -->
+
+    <h2>Your Images</h2>
+
+
+    {% if images %}
+
+        {% for image in images %}
+
+            <div
+                style="
+                    margin-bottom: 30px;
+                    padding: 15px;
+                    border: 1px solid #ccc;
+                    width: 300px;
+                "
+            >
+
+                <!-- IMAGE -->
+
+                <img
+                    src="{{ url_for('view_image', filename=image) }}"
+                    alt="{{ image }}"
+                    width="250"
+                >
+
+
+                <!-- FILENAME -->
+
+                <p>
+
+                    <strong>
+                        {{ image }}
+                    </strong>
+
+                </p>
+
+
+                <!-- ================================================= -->
+                <!-- RENAME -->
+                <!-- ================================================= -->
+
+                <form
+                    action="{{ url_for('edit', filename=image) }}"
+                    method="POST"
+                >
+
+                    <input
+                        type="text"
+                        name="new_filename"
+                        placeholder="New filename"
+                        required
+                    >
+
+                    <button type="submit">
+                        Rename
+                    </button>
+
+                </form>
+
+
+                <br>
+
+
+                <!-- ================================================= -->
+                <!-- DELETE -->
+                <!-- ================================================= -->
+
+                <form
+                    action="{{ url_for('delete', filename=image) }}"
+                    method="POST"
+                >
+
+                    <button type="submit">
+                        Delete
+                    </button>
+
+                </form>
+
+            </div>
+
+        {% endfor %}
+
+
+    {% else %}
+
+        <p>
+            No images uploaded yet.
+        </p>
+
+    {% endif %}
+
+
+</body>
+
+</html>
