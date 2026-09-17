@@ -1,4 +1,26 @@
+# Python
 venv/
 __pycache__/
 *.pyc
+
+# Environment / secrets
 .env
+*.env
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+
+# GCP credentials
+application_default_credentials.json
+*-credentials.json
+service-account*.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

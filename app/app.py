@@ -1,79 +1,220 @@
 import os
 
+import psycopg2
+
 from flask import (
     Flask,
     render_template,
     request,
     redirect,
     url_for,
-    Response
+    Response,
+    session
+)
+
+from werkzeug.security import (
+    generate_password_hash,
+    check_password_hash
 )
 
 from werkzeug.utils import secure_filename
+
 from google.cloud import storage
 
 
 app = Flask(__name__)
 
+app.secret_key = os.environ.get(
+    "FLASK_SECRET_KEY",
+    "dev-secret-key-change-later"
+)
 
-# ============================================================
-# GCS CONFIGURATION
-# ============================================================
 
-BUCKET_NAME = "terraform-webapp-images-12345"
+# -----------------------------
+# Google Cloud Storage
+# -----------------------------
+
+BUCKET_NAME = os.environ["GCS_BUCKET_NAME"]
 
 storage_client = storage.Client()
-
 bucket = storage_client.bucket(BUCKET_NAME)
 
 
-# ============================================================
-# TEMPORARY USER
-# ============================================================
+# -----------------------------
+# Cloud SQL
+# -----------------------------
 
-# This is temporary.
-# Later Cloud SQL + authentication will provide the real user ID.
+def get_db_connection():
+    db_host = os.environ.get("DB_HOST", "127.0.0.1")
 
-CURRENT_USER_ID = 1
-
-
-# ============================================================
-# HOME PAGE
-# ============================================================
+    return psycopg2.connect(
+        host=db_host,
+        port=int(os.environ.get("DB_PORT", "5432")),
+        database="imageapp",
+        user="appuser",
+        password=os.environ["DB_PASSWORD"]
+    )
+# -----------------------------
+# Home
+# -----------------------------
 
 @app.route("/")
 def home():
 
-    prefix = f"users/{CURRENT_USER_ID}/"
+    user_id = session.get("user_id")
 
-    blobs = bucket.list_blobs(
-        prefix=prefix
-    )
+    if not user_id:
+        return redirect(url_for("login"))
 
-    images = []
+    connection = get_db_connection()
+    cursor = connection.cursor()
 
-    for blob in blobs:
+    cursor.execute("""
+        SELECT
+            id,
+            filename,
+            gcs_object,
+            content_type,
+            created_at
+        FROM images
+        WHERE user_id = %s
+        ORDER BY created_at DESC;
+    """, (user_id,))
 
-        if blob.name == prefix:
-            continue
+    images = cursor.fetchall()
 
-        filename = blob.name.split("/")[-1]
-
-        if filename:
-            images.append(filename)
+    cursor.close()
+    connection.close()
 
     return render_template(
         "index.html",
         images=images
     )
 
+# -----------------------------
+# Register
+# -----------------------------
 
-# ============================================================
-# UPLOAD IMAGE
-# ============================================================
+@app.route("/register", methods=["GET", "POST"])
+def register():
+
+    if request.method == "GET":
+        return render_template("register.html")
+
+    username = request.form.get("username")
+    email = request.form.get("email")
+    password = request.form.get("password")
+
+    if not username or not email or not password:
+        return "All fields are required", 400
+
+    password_hash = generate_password_hash(password)
+
+    connection = get_db_connection()
+    cursor = connection.cursor()
+
+    try:
+
+        cursor.execute("""
+            INSERT INTO users
+            (username, email, password_hash)
+            VALUES (%s, %s, %s)
+            RETURNING id;
+        """, (
+            username,
+            email,
+            password_hash
+        ))
+
+        user_id = cursor.fetchone()[0]
+
+        connection.commit()
+
+    except psycopg2.errors.UniqueViolation:
+
+        connection.rollback()
+
+        cursor.close()
+        connection.close()
+
+        return "Username or email already exists", 400
+
+    cursor.close()
+    connection.close()
+
+    session["user_id"] = user_id
+    session["username"] = username
+
+    return redirect(url_for("home"))
+
+
+# -----------------------------
+# Login
+# -----------------------------
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+
+    if request.method == "GET":
+        return render_template("login.html")
+
+    email = request.form.get("email")
+    password = request.form.get("password")
+
+    connection = get_db_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        SELECT id, username, password_hash
+        FROM users
+        WHERE email = %s;
+    """, (email,))
+
+    user = cursor.fetchone()
+
+    cursor.close()
+    connection.close()
+
+    if not user:
+        return "Invalid email or password", 401
+
+    user_id, username, password_hash = user
+
+    if not check_password_hash(
+        password_hash,
+        password
+    ):
+        return "Invalid email or password", 401
+
+    session["user_id"] = user_id
+    session["username"] = username
+
+    return redirect(url_for("home"))
+
+
+# -----------------------------
+# Logout
+# -----------------------------
+
+@app.route("/logout")
+def logout():
+
+    session.clear()
+
+    return redirect(url_for("login"))
+
+
+# -----------------------------
+# Upload
+# -----------------------------
 
 @app.route("/upload", methods=["POST"])
 def upload():
+
+    user_id = session.get("user_id")
+
+    if not user_id:
+        return redirect(url_for("login"))
 
     file = request.files.get("image")
 
@@ -82,130 +223,241 @@ def upload():
 
     filename = secure_filename(file.filename)
 
-    if not filename:
-        return redirect(url_for("home"))
+    gcs_object = f"users/{user_id}/{filename}"
 
-    object_name = (
-        f"users/{CURRENT_USER_ID}/{filename}"
-    )
-
-    blob = bucket.blob(object_name)
+    blob = bucket.blob(gcs_object)
 
     blob.upload_from_file(
         file,
         content_type=file.content_type
     )
 
+    connection = get_db_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        INSERT INTO images
+        (
+            user_id,
+            filename,
+            gcs_object,
+            content_type
+        )
+        VALUES (%s, %s, %s, %s)
+        RETURNING id;
+    """, (
+        user_id,
+        filename,
+        gcs_object,
+        file.content_type
+    ))
+
+    image_id = cursor.fetchone()[0]
+
+    connection.commit()
+
+    cursor.close()
+    connection.close()
+
+    print(f"Uploaded image ID: {image_id}")
+
     return redirect(url_for("home"))
 
+# -----------------------------
+# View image
+# -----------------------------
 
-# ============================================================
-# VIEW IMAGE
-# ============================================================
+@app.route("/image/<int:image_id>")
+def view_image(image_id):
 
-@app.route("/image/<filename>")
-def view_image(filename):
+    user_id = session.get("user_id")
 
-    filename = secure_filename(filename)
+    if not user_id:
+        return redirect(url_for("login"))
 
-    if not filename:
-        return redirect(url_for("home"))
+    connection = get_db_connection()
+    cursor = connection.cursor()
 
-    object_name = (
-        f"users/{CURRENT_USER_ID}/{filename}"
-    )
+    cursor.execute("""
+        SELECT gcs_object, content_type
+        FROM images
+        WHERE id = %s
+        AND user_id = %s;
+    """, (
+        image_id,
+        user_id
+    ))
 
-    blob = bucket.blob(object_name)
+    image = cursor.fetchone()
+
+    cursor.close()
+    connection.close()
+
+    if not image:
+        return "Image not found", 404
+
+    gcs_object, content_type = image
+
+    blob = bucket.blob(gcs_object)
 
     if not blob.exists():
-        return "Image not found", 404
+        return "File not found in Cloud Storage", 404
 
     image_data = blob.download_as_bytes()
 
     return Response(
         image_data,
-        mimetype=blob.content_type
+        mimetype=content_type
     )
+    
+@app.route(
+    "/edit/<int:image_id>",
+    methods=["POST"]
+)
+def edit_image(image_id):
 
+    user_id = session.get("user_id")
 
-# ============================================================
-# DELETE IMAGE
-# ============================================================
-
-@app.route("/delete/<filename>", methods=["POST"])
-def delete(filename):
-
-    filename = secure_filename(filename)
-
-    if not filename:
-        return redirect(url_for("home"))
-
-    object_name = (
-        f"users/{CURRENT_USER_ID}/{filename}"
-    )
-
-    blob = bucket.blob(object_name)
-
-    if blob.exists():
-        blob.delete()
-
-    return redirect(url_for("home"))
-
-
-# ============================================================
-# EDIT / RENAME IMAGE
-# ============================================================
-
-@app.route("/edit/<filename>", methods=["POST"])
-def edit(filename):
-
-    filename = secure_filename(filename)
+    if not user_id:
+        return redirect(url_for("login"))
 
     new_filename = secure_filename(
-        request.form.get(
-            "new_filename",
-            ""
-        )
+        request.form.get("new_filename", "")
     )
 
-    if not filename or not new_filename:
+    if not new_filename:
         return redirect(url_for("home"))
 
-    old_object_name = (
-        f"users/{CURRENT_USER_ID}/{filename}"
-    )
+    connection = get_db_connection()
+    cursor = connection.cursor()
 
-    new_object_name = (
-        f"users/{CURRENT_USER_ID}/{new_filename}"
+    cursor.execute("""
+        SELECT gcs_object
+        FROM images
+        WHERE id = %s
+        AND user_id = %s;
+    """, (
+        image_id,
+        user_id
+    ))
+
+    image = cursor.fetchone()
+
+    if not image:
+
+        cursor.close()
+        connection.close()
+
+        return "Image not found", 404
+
+    old_gcs_object = image[0]
+
+    new_gcs_object = (
+        f"users/{user_id}/{new_filename}"
     )
 
     old_blob = bucket.blob(
-        old_object_name
+        old_gcs_object
     )
 
     if not old_blob.exists():
-        return "Image not found", 404
 
-    # GCS rename = copy + delete
+        cursor.close()
+        connection.close()
+
+        return "File not found in Cloud Storage", 404
+
     bucket.copy_blob(
         old_blob,
         bucket,
-        new_object_name
+        new_gcs_object
     )
 
     old_blob.delete()
 
+    cursor.execute("""
+        UPDATE images
+        SET
+            filename = %s,
+            gcs_object = %s,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = %s
+        AND user_id = %s;
+    """, (
+        new_filename,
+        new_gcs_object,
+        image_id,
+        user_id
+    ))
+
+    connection.commit()
+
+    cursor.close()
+    connection.close()
+
+    return redirect(url_for("home"))
+
+# -----------------------------
+# Delete
+# -----------------------------
+
+@app.route(
+    "/delete/<int:image_id>",
+    methods=["POST"]
+)
+def delete_image(image_id):
+
+    user_id = session.get("user_id")
+
+    if not user_id:
+        return redirect(url_for("login"))
+
+    connection = get_db_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        SELECT gcs_object
+        FROM images
+        WHERE id = %s
+        AND user_id = %s;
+    """, (
+        image_id,
+        user_id
+    ))
+
+    image = cursor.fetchone()
+
+    if not image:
+
+        cursor.close()
+        connection.close()
+
+        return "Image not found", 404
+
+    gcs_object = image[0]
+
+    blob = bucket.blob(gcs_object)
+
+    if blob.exists():
+        blob.delete()
+
+    cursor.execute("""
+        DELETE FROM images
+        WHERE id = %s
+        AND user_id = %s;
+    """, (
+        image_id,
+        user_id
+    ))
+
+    connection.commit()
+
+    cursor.close()
+    connection.close()
+
     return redirect(url_for("home"))
 
 
-# ============================================================
-# RUN APPLICATION
-# ============================================================
-
 if __name__ == "__main__":
-
-    app.run(
-        host="0.0.0.0",
-        port=5000,
-        debug=True
-    )
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
